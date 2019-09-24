@@ -24,7 +24,7 @@ use codec::{Encode, Decode};
 use sr_primitives::{
 	weights::{SimpleDispatchInfo, DispatchInfo},
 	transaction_validity::{TransactionValidityError, ValidTransaction, TransactionValidity},
-	traits::{Hash as HashT, StaticLookup, SignedExtension}
+	traits::{Hash as HashT, SignedExtension}
 };
 
 use srml_support::{
@@ -167,6 +167,9 @@ decl_storage! {
 		/// thread. If None, then it will be the last normally scheduled parathread (or the last
 		/// parachain if there are no parathreads).
 		Retrying: Option<u32>;
+
+		/// Users who have paid the Parathread deposit for a particular ParaId.
+		Debtors: map ParaId => T::AccountId;
 	}
 	add_extra_genesis {
 		config(parachains): Vec<(ParaId, Vec<u8>, Vec<u8>)>;
@@ -242,6 +245,8 @@ decl_module! {
 			let _ = <Self as Registrar<T::AccountId>>::
 				register_para(id, info, code, initial_head_data);
 
+			Debtors::<T>::insert(id, &who);
+
 			Self::deposit_event(Event::ParathreadRegistered(id));
 		}
 
@@ -266,17 +271,15 @@ decl_module! {
 		/// Ensure that before calling this that any funds you want emptied from the parathread's
 		/// account is moved out; after this it will be impossible to retrieve them (without
 		/// governance intervention).
-		fn deregister_parathread(origin,
-			debtor: <T::Lookup as StaticLookup>::Source
-		) {
+		fn deregister_parathread(origin) {
 			let id = parachains::ensure_parachain(<T as Trait>::Origin::from(origin))?;
-			let debtor = T::Lookup::lookup(debtor)?;
 
 			let info = Paras::get(id).ok_or("invalid id")?;
 			if let Scheduling::Dynamic = info.scheduling {} else { Err("invalid parathread id")? }
 
 			<Self as Registrar<T::AccountId>>::deregister_para(id)?;
 
+			let debtor = Debtors::<T>::take(id);
 			let _ = T::Currency::unreserve(&debtor, T::ParathreadDeposit::get());
 
 			Self::deposit_event(Event::ParathreadRegistered(id));
@@ -818,10 +821,11 @@ fn new_test_ext(parachains: Vec<(ParaId, Vec<u8>, Vec<u8>)>) -> TestExternalitie
 			run_to_block(4);
 
 			// Deregister a parachain
-			assert_ok!(Registrar::deregister_parathread(parachains::Origin::Parachain(ParaId::from(1000)).into(), 0));
+			assert_ok!(Registrar::deregister_parathread(parachains::Origin::Parachain(ParaId::from(1000)).into()));
 
 			run_to_block(5);
 
+			// Funds returned to original debtor
 			assert_eq!(Balances::free_balance(0), original_balance);
 			assert_eq!(Balances::reserved_balance(0), 0);
 
@@ -834,6 +838,20 @@ fn new_test_ext(parachains: Vec<(ParaId, Vec<u8>, Vec<u8>)>) -> TestExternalitie
 	#[test]
 	fn parathread_can_activate() {
 		with_externalities(&mut new_test_ext(vec![]), || {
+			run_to_block(2);
+			assert_ok!(Registrar::register_parathread(Origin::signed(0), vec![7,8,9], vec![1, 1, 1]));
+
+			run_to_block(3);
+			assert_eq!(Registrar::paras(&1000u32.into()), Some(ParaInfo { scheduling: Scheduling::Dynamic }));
+
+			let para_id = ParaId::from(1000);
+			let collator_id = None;
+			let head_data_hash = <Test as system::Trait>::Hashing::hash(&vec![1, 1, 1]);
+			let call = <Test as system::Trait>::Call::select_parathread(para_id, collator_id, head_data_hash));
+			let info = DispatchInfo::default();
+			let len = 0;
+
+			assert_ok!(LimitParathreadCommits::<Test>(1).validate(&0, call, info, 0));
 
 		});
 	}
